@@ -1,0 +1,403 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KernelDensity
+
+# Function to generate a time series with multiple anomalies
+def generate_time_series_with_anomaly(length=100, anomaly_positions=[49], anomaly_value=5):
+    time_series = np.sin(np.linspace(0, 4 * np.pi, length)) + 0.1 * np.random.randn(length)
+    for position in anomaly_positions:
+        time_series[position] += anomaly_value  # Adding significant outliers
+    return time_series
+
+
+# Z-normalization of the time series
+def z_normalize(time_series):
+    scaler = StandardScaler()
+    return scaler.fit_transform(time_series.reshape(-1, 1)).flatten()
+
+# Sliding window to extract subsequences
+def sliding_window(time_series, window_size):
+    subsequences = []
+    indices = []  # Store the starting indices of each subsequence
+    for i in range(len(time_series) - window_size + 1):
+        subsequence = time_series[i:i + window_size]
+        subsequences.append(subsequence)
+        indices.append(i)  # Keep track of the starting index
+    return np.array(subsequences), indices
+
+# Apply SAX to each subsequence
+def sax_transform(subsequences, word_size, alphabet_size):
+    breakpoints = np.linspace(-1, 1, alphabet_size - 1)
+    sax_words = []
+
+    for subsequence in subsequences:
+        segment_size = len(subsequence) // word_size
+        paa_representation = [np.mean(subsequence[i:i + segment_size]) for i in range(0, len(subsequence), segment_size)]
+        sax_word = ''.join([chr(97 + np.sum(mean_value > breakpoints)) for mean_value in paa_representation])
+        sax_words.append(sax_word)
+
+    return sax_words
+
+# Numerosity Reduction (remove consecutive identical SAX words)
+def numerosity_reduction(sax_words):
+    reduced_sax_words = [sax_words[0]]
+    for i in range(1, len(sax_words)):
+        if sax_words[i] != sax_words[i - 1]:
+            reduced_sax_words.append(sax_words[i])
+    return reduced_sax_words
+
+# Map rules (SAX words) back to original subsequences
+# Very useful function for both Density Curve Rule and Rare Rule Anomaly
+def map_sax_to_subsequences(reduced_sax_words, original_time_series, window_size, sliding_window_indices):
+    subsequences = []
+    for idx, word in enumerate(reduced_sax_words):
+        start_index = sliding_window_indices[idx]
+        if start_index + window_size <= len(original_time_series):
+            subsequence = original_time_series[start_index:start_index + window_size]
+            subsequences.append((word, subsequence))
+    return subsequences
+
+# Sequitur Implementation
+class Rule:
+
+    def __init__(self, numRules):
+        self.number = numRules
+        self.the_guard = Guard(self)
+        self.count = 0
+        self.index = 0
+
+    def first(self):
+        return self.the_guard.n
+
+    def last(self):
+        return self.the_guard.p
+
+    def get_rules(self):
+        rules = []
+        processedRules = 0
+        text = ''
+        charCounter = 0
+        text += "Usage\tRule\n"
+        rules.append(self)
+
+        while (processedRules < len(rules)):
+            currentRule = rules[processedRules]
+            text += " " + str(currentRule.count) + '\tR' + str(processedRules) + ' -> '
+            sym = currentRule.first()
+
+            while True:
+                if sym.is_guard():
+                    break
+                if sym.is_nonterminal():
+                    rule = sym.r
+                    if len(rules) > rule.index and rules[rule.index] == rule:
+                        index = rule.index
+                    else:
+                        index = len(rules)
+                        rule.index = index
+                        rules.append(rule)
+                    text += 'R' + str(index)
+                else:
+                    if sym.value == ' ':
+                        text += '_'
+                    elif sym.value == '\n':
+                        text += '\\n'
+                    else:
+                        text += str(sym.value)
+                text += ' '
+                sym = sym.n
+            text += '\n'
+            processedRules += 1
+        return text
+
+digrams = {}
+
+class Symbol:
+    def __init__(self):
+        self.num_terminals = 100000
+        self.prime = 2265539
+        self.value=' '
+        global digrams
+
+    def clone(self):
+        sym = Symbol()
+        sym.value = self.value
+        sym.n = self.n
+        sym.p = self.p
+        return sym
+
+    def join(self, left, right):
+        if left.n != None:
+            left.delete_digram()
+            if (right.p != None and right.n != None and
+                    right.value == right.p.value and
+                    right.value == right.n.value):
+                digrams[str(right.value) + str(right.n.value)] = right
+            if (left.p != None and left.n != None and
+                    left.value == left.p.value and
+                    left.value == left.n.value):
+                digrams[str(left.p.value) + str(left.value)] = left.p
+        left.n = right
+        right.p = left
+
+    def insert_after(self, to_insert):
+        self.join(to_insert, self.n)
+        self.join(self, to_insert)
+
+    def digram(self):
+        return str(self.value) + str(self.n.value)
+
+    def delete_digram(self):
+        if self.n.is_guard(): return
+
+        if self.digram() in digrams:
+            dummy = digrams[self.digram()]
+            if dummy == self:
+                del digrams[self.digram()]
+
+    def is_guard(self):
+        return False
+
+    def is_nonterminal(self):
+        return False
+
+    def check(self):
+        if self.n.is_guard():
+            return False
+
+        if self.digram() not in digrams:
+            digrams[self.digram()] = self
+            return False
+
+        found = digrams[self.digram()]
+        if found.n != self:
+            self.match(self, found)
+        return True
+
+    def cleanup(self):
+        pass
+
+    def substitute(self, r):
+        self.cleanup()
+        self.n.cleanup()
+        self.p.insert_after(NonTerminal(r))
+        if not self.p.check(): self.p.n.check()
+
+    def match(self, newD, matching):
+        #print 'Matching ', newD.value, matching.value
+        global numRules
+
+        if matching.p.is_guard() and matching.n.n.is_guard():
+            #print 'Using Rule'
+            r = (matching.p).r
+            newD.substitute(r)
+        else:
+            #print 'Creating Rule'
+            r = Rule(numRules)
+            numRules += 1
+            first = newD.clone()
+            second = newD.n.clone()
+            r.the_guard.n = first
+            first.p = r.the_guard
+            first.n = second
+            second.p = first
+            second.n = r.the_guard
+            r.the_guard.p = second
+            matching.substitute(r)
+            newD.substitute(r)
+            digrams[str(first.value)+str(first.n.value)]=first
+
+        #print 'Checking Rule Utility'
+        if (r.first()).is_nonterminal() and (r.first()).r.count == 1:
+            (r.first()).expand()
+
+    def hash_code(self):
+        code = 21599 * self.value + 20507*self.n.value
+        code = code%self.prime
+        return code
+
+    def equals(self,obj):
+        return self.value == obj.value and self.n.value == obj.n.value
+
+class Terminal(Symbol):
+  def __init__(self, value):
+    self.value=value
+    self.p = None
+    self.n = None
+
+  def cleanup(self):
+    self.join(self.p, self.n)
+    self.delete_digram()
+
+  def clone(self):
+    sym = Terminal(self.value)
+    sym.p = self.p
+    sym.n = self.n
+    return sym
+
+class NonTerminal(Symbol):
+  def __init__(self, rule):
+    self.r = rule
+    self.r.count += 1
+    #self.value=self.numTerminals+self.r.number
+    self.value = self.r.number
+    self.p = None
+    self.n = None
+
+  def clone(self):
+    sym = NonTerminal(self.r)
+    sym.p = self.p
+    sym.n = self.n
+    return sym
+
+  def cleanup(self):
+    self.join(self.p, self.n)
+    self.delete_digram()
+    self.r.count -= 1
+
+  def is_nonterminal(self):
+    return True
+
+  def expand(self):
+    self.join(self.p, self.r.first())
+    self.join(self.r.last(), self.n)
+    digrams[str(self.r.last().value) + str(self.r.last().n.value)] = self.r.last()
+    self.r.the_guard.r = None
+    self.r.the_guard = None
+
+class Guard(Symbol):
+  def __init__(self, rule):
+    self.r = rule
+    self.value = ' '
+    self.p = self
+    self.n = self
+
+  def cleanup(self):
+    self.join(self.p, self.n)
+
+  def is_guard(self):
+    return True
+
+  def check(self):
+    return False
+
+numRules=0
+
+def convert_to_terminal(element):
+  # This function converts an element from your array to a Terminal symbol
+  return Terminal(element)
+
+def run_sequitur(data):
+  global numRules
+  first_rule = Rule(numRules)
+  numRules += 1
+
+  global digrams
+  digrams = {}
+
+  for element in data:
+    terminal = convert_to_terminal(element)
+    (first_rule.last()).insert_after(terminal)
+    first_rule.last().p.check()
+
+  return first_rule.get_rules()
+
+def test():
+  input_array = reduced_sax_words
+  input_data = input_array  # Use your array directly
+  result = run_sequitur(input_data)
+
+  # Split the output into lines
+  lines = result.splitlines()
+
+  # Extract the rules for R0
+  r0_rules = []
+  for line in lines:
+      if line.startswith(" 0\tR0"):
+          r0_rules.append(line.strip())
+  import re
+
+  cleaned_output = []
+  for item in r0_rules:
+    if isinstance(item, str):  # Check if item is a string
+        # Remove R followed by numbers and the prefix '0\t -> '
+        cleaned_item = re.sub(r'\bR\d+\b', '', item)
+        cleaned_item = re.sub(r'^\d+\t -> ', '', cleaned_item)
+        cleaned_item = cleaned_item.strip()  # Strip any leading/trailing spaces
+
+        # Split the cleaned item into a list of words and extend the cleaned_output list
+        cleaned_output.extend(cleaned_item.split())
+
+  #print(cleaned_output)
+  return cleaned_output
+# End of Sequitur Algorithm
+
+# Generate the dataset with an anomaly
+np.random.seed(0)
+time_series_with_anomaly = generate_time_series_with_anomaly()
+
+# Parameters
+window_size = 12  # Size of sliding window
+word_size = 4    # Number of segments for PAA in each subsequence
+alphabet_size = 4 # Number of SAX symbols (e.g. A, B, C)
+
+# Step 1: Z-normalization
+z_normalized_ts = z_normalize(time_series_with_anomaly)
+print("\nZ-Normalized Time Series:")
+print(z_normalized_ts)
+
+# Step 2: Extract subsequences using sliding window
+subsequences, sliding_window_indices = sliding_window(z_normalized_ts, window_size)
+print("\nExtracted Subsequences (Sliding Window):")
+for i, subseq in enumerate(subsequences):
+    print(f"Subsequence {i}: {subseq}")
+
+# Step 3: Apply SAX to subsequences
+sax_words = sax_transform(subsequences, word_size, alphabet_size)
+print("\nSAX Words (Before Numerosity Reduction):")
+print(sax_words)
+
+# Step 4: Apply Numerosity Reduction
+reduced_sax_words = numerosity_reduction(sax_words)
+print("\nSAX Words (After Numerosity Reduction):")
+print(reduced_sax_words)
+
+# Step 5: Apply the updated Sequitur to reduced SAX words
+sequitur_output = test()
+
+print(type(sequitur_output))
+# Print the reduced SAX output generated by Sequitur
+print("\nReduced SAX Output after Sequitur Processing:")
+print(sequitur_output)
+
+# Density Rule Curve implementation
+# Create an array of zeros with the same length as the time series
+occurrences = np.zeros_like(z_normalized_ts)
+
+# Stack both arrays together as columns
+result = np.column_stack((z_normalized_ts, occurrences))
+
+# Print the resulting double array
+print(result)
+
+
+# Step 6: Map SAX words to original subsequences
+mapped_subsequences = map_sax_to_subsequences(sequitur_output, z_normalized_ts, window_size, sliding_window_indices)
+print("\nMapping SAX Words to Original Subsequences:")
+for word, subseq in mapped_subsequences:
+    print(f"SAX Word {word}: Mapped Subsequence: {subseq}")
+
+# Extract and concatenate all the float values
+all_floats = np.concatenate([tup[1] for tup in mapped_subsequences])
+
+for element in all_floats:
+    # Find where the element in compare_array matches the first column of double_array
+    match_index = np.where(result[:, 0] == element)[0]
+
+    # If a match is found, increment the corresponding element in the second column
+    if match_index.size > 0:
+        result[match_index[0], 1] += 1
+
+np.set_printoptions(precision=8, suppress=True)
+print(result) # Results of counting
